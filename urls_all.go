@@ -2,9 +2,7 @@ package main
 
 import (
 	"bufio"
-	"context"
 	"crypto/tls"
-	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -21,14 +19,13 @@ const (
 	waybackAddr = "web.archive.org:443"
 )
 
-// tuned HTTP transport with keep-alive and timeouts
+// create HTTP client with timeouts
 func makeClient() *http.Client {
 	dialer := &net.Dialer{
 		Timeout:   7 * time.Second,
 		KeepAlive: 60 * time.Second,
 	}
-
-	tr := &http.Transport{
+	trans := &http.Transport{
 		Proxy:                 http.ProxyFromEnvironment,
 		DialContext:           dialer.DialContext,
 		ForceAttemptHTTP2:     true,
@@ -42,39 +39,17 @@ func makeClient() *http.Client {
 			ServerName: waybackHost,
 		},
 	}
-
 	return &http.Client{
-		Transport: tr,
-		Timeout:   45 * time.Second, // per request ceiling
+		Transport: trans,
+		Timeout:   45 * time.Second, // timeout applies to whole request including reading response
 	}
 }
 
-// warmup establishes TCP + TLS and performs a cheap HEAD to prime pools
-func warmup(ctx context.Context, c *http.Client) error {
-	// Establish a raw TCP to ensure path is open (best-effort)
-	d := net.Dialer{Timeout: 5 * time.Second, KeepAlive: 30 * time.Second}
-	if conn, err := d.DialContext(ctx, "tcp", waybackAddr); err == nil {
-		_ = conn.Close()
-	}
-
-	// Lightweight HEAD to prime TLS, ALPN, and HTTP/2 session
-	req, _ := http.NewRequestWithContext(ctx, http.MethodHead, "https://"+waybackHost+"/", nil)
-	req.Header.Set("User-Agent", "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/141.0.0.0 Safari/537.36")
-	resp, err := c.Do(req)
-	if err != nil {
-		return err
-	}
-	io.Copy(io.Discard, resp.Body)
-	resp.Body.Close()
-	return nil
-}
-
-// backoff helper
+// retry backoff with jitter
 func retryBackoff(attempt int) time.Duration {
 	if attempt <= 0 {
 		return 0
 	}
-	// 400ms * 2^(n-1), capped
 	d := 400 * time.Millisecond
 	for i := 1; i < attempt; i++ {
 		d *= 2
@@ -83,24 +58,21 @@ func retryBackoff(attempt int) time.Duration {
 			break
 		}
 	}
-	// add jitter
 	j := time.Duration(int64(d) / 5)
 	return d + time.Duration(time.Now().UnixNano()%int64(j))
 }
 
+// check if error or HTTP code is transient
 func transient(err error, code int) bool {
 	if err != nil {
-		var ne net.Error
-		if errors.As(err, &ne) && (ne.Timeout() || ne.Temporary()) {
+		if ne, ok := err.(net.Error); ok && (ne.Timeout() || ne.Temporary()) {
 			return true
 		}
-		// treat unexpected EOFs and connection resets as transient
 		msg := strings.ToLower(err.Error())
 		if strings.Contains(msg, "reset") || strings.Contains(msg, "broken pipe") || strings.Contains(msg, "eof") {
 			return true
 		}
 	}
-	// Retry common transient HTTP codes
 	if code == http.StatusTooManyRequests || (code >= 500 && code <= 504) {
 		return true
 	}
@@ -108,27 +80,25 @@ func transient(err error, code int) bool {
 }
 
 func fetchAllURLs(domain string) {
-	c := makeClient()
+	client := makeClient()
 
-	// Warmup phase with a bounded context (same approach as rcesh.go)
-	wctx, cancelWarm := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancelWarm()
-	_ = warmup(wctx, c) // best-effort; proceed even if this fails
-
-	// Build CDX URL
 	cdxURL := fmt.Sprintf("https://%s/cdx/search/cdx?url=*.%s/*&collapse=urlkey&output=text&fl=original", waybackHost, domain)
 
-	// Ensure reports folder exists
-	_ = os.MkdirAll("reports", os.ModePerm)
+	// Ensure reports directory
+	if err := os.MkdirAll("reports", os.ModePerm); err != nil {
+		fmt.Println("Error creating reports directory:", err)
+		return
+	}
+
 	filePath := fmt.Sprintf("reports/%s_all.txt", domain)
 	file, err := os.Create(filePath)
 	if err != nil {
-		fmt.Println("Error creating file:", err)
+		fmt.Println("Error creating output file:", err)
 		return
 	}
 	defer file.Close()
 
-	// Graceful interrupt
+	// Handle interrupts gracefully
 	sigChan := make(chan os.Signal, 1)
 	signal.Notify(sigChan, os.Interrupt, syscall.SIGTERM)
 	go func() {
@@ -138,12 +108,12 @@ func fetchAllURLs(domain string) {
 		os.Exit(0)
 	}()
 
-	// Spinner + live count
+	// Spinner for display
 	spinnerChars := []rune{'-', '\\', '|', '/'}
 	count := 0
 	spinnerIndex := 0
-
 	done := make(chan bool)
+
 	go func() {
 		for {
 			select {
@@ -157,29 +127,45 @@ func fetchAllURLs(domain string) {
 		}
 	}()
 
-	// Request with retries
 	var resp *http.Response
 	var reqErr error
+
 	const maxAttempts = 5
 	for attempt := 0; attempt < maxAttempts; attempt++ {
-		reqCtx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
-		req, _ := http.NewRequestWithContext(reqCtx, http.MethodGet, cdxURL, nil)
-		req.Header.Set("User-Agent", "Laksh-Wayback-Fetcher/1.0")
-		resp, reqErr = c.Do(req)
-		cancel()
+		req, _ := http.NewRequest(http.MethodGet, cdxURL, nil)
+
+		// Add realistic headers
+		req.Header.Set("User-Agent", "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/142.0.0.0 Safari/537.36")
+		req.Header.Set("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7")
+		req.Header.Set("Accept-Language", "en-IN,en-GB;q=0.9,en-US;q=0.8,en;q=0.7,ta;q=0.6,nl;q=0.5,pt;q=0.4")
+		req.Header.Set("Cache-Control", "max-age=0")
+		req.Header.Set("Cookie", "donation-identifier=91b4e0553da81d3a7631fbaa3e855bff; wb-p-SERVER=wwwb-app242; wb-cdx-SERVER=wwwb-app240")
+		req.Header.Set("Sec-Ch-Ua", `"Chromium";v="142", "Google Chrome";v="142", "Not_A Brand";v="99"`)
+		req.Header.Set("Sec-Ch-Ua-Mobile", "?0")
+		req.Header.Set("Sec-Ch-Ua-Platform", `"Linux"`)
+		req.Header.Set("Sec-Fetch-Dest", "document")
+		req.Header.Set("Sec-Fetch-Mode", "navigate")
+		req.Header.Set("Sec-Fetch-Site", "none")
+		req.Header.Set("Sec-Fetch-User", "?1")
+		req.Header.Set("Upgrade-Insecure-Requests", "1")
+		req.Host = waybackHost
+
+		resp, reqErr = client.Do(req)
 
 		var code int
 		if resp != nil {
 			code = resp.StatusCode
 		}
+
 		if reqErr == nil && code >= 200 && code < 300 {
 			break
 		}
-		// Close body on error to free connection
+
 		if resp != nil && resp.Body != nil {
 			io.Copy(io.Discard, resp.Body)
 			resp.Body.Close()
 		}
+
 		if !transient(reqErr, code) || attempt == maxAttempts-1 {
 			if reqErr != nil {
 				fmt.Printf("\nError fetching URLs: %v\n", reqErr)
@@ -189,16 +175,20 @@ func fetchAllURLs(domain string) {
 			done <- true
 			return
 		}
+
 		time.Sleep(retryBackoff(attempt + 1))
+	}
+
+	if resp == nil {
+		done <- true
+		fmt.Println("\nFailed to get a response")
+		return
 	}
 	defer resp.Body.Close()
 
-	// Stream read lines
 	scanner := bufio.NewScanner(resp.Body)
-	// enlarge buffer to handle long lines
-	const maxLine = 2 * 1024 * 1024
 	buf := make([]byte, 0, 128*1024)
-	scanner.Buffer(buf, maxLine)
+	scanner.Buffer(buf, 2*1024*1024) // allow long lines
 
 	for scanner.Scan() {
 		line := strings.TrimSpace(scanner.Text())
@@ -210,7 +200,6 @@ func fetchAllURLs(domain string) {
 	}
 
 	done <- true
-
 	if err := scanner.Err(); err != nil {
 		fmt.Println("\nError reading response:", err)
 	} else {
@@ -220,7 +209,7 @@ func fetchAllURLs(domain string) {
 
 func main() {
 	if len(os.Args) < 2 {
-		fmt.Println("Usage: go run urls_all.go <domain>")
+		fmt.Println("Usage: go run yourfile.go <domain>")
 		os.Exit(1)
 	}
 	domain := os.Args[1]
